@@ -1,0 +1,11 @@
+{
+  "projectId": "pair-wise-gsb-39",
+  "projectName": "pair-wise-gsb-39",
+  "category": "困难 Python 项目",
+  "businessDomain": "公共交通",
+  "projectForm": "完整项目",
+  "codeScope": "backend, frontend",
+  "languages": ["Python", "HTML", "CSS", "JavaScript"],
+  "summary": "公共交通中断改道、停运跳站、无障碍路径和发布快照服务。",
+  "containerized": false
+}
