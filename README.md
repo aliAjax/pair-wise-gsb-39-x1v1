@@ -19,6 +19,7 @@ python app.py --port 8010
 - 班次时间以服务日零点起算，允许超过 1440 分钟。例如 1430 分发车、21 分钟到达会显示为次日 `00:21`。
 - 修改只允许发生在草稿版本；创建新版本会复制父版本变更，已发布快照继续保留。
 - 发布在一个 SQLite 事务内写入方案快照和 SHA-256，旧发布版本不会被覆盖。
+- 发布同时冻结受影响班次台账：班次经过被封停或跳站的站点、且到站服务时间落入生效窗口才命中，绕行和无障碍变更不入账；同一班次在同一方案只记一条，多条命中聚合在明细里。台账写入 `affected_trips` 并嵌入快照（哈希覆盖），之后基础数据再改不动已发布清单，只能在新版本里实时重算。
 
 ## API
 
@@ -31,6 +32,8 @@ python app.py --port 8010
 - `POST /api/versions/{id}/submit|approve|reject|publish`：完成复核发布流程。
 - `GET /api/route?from=1&to=5&version_id=1&at_minute=1430&accessible=true`：查询路径、耗时和到达时间。
 - `GET /api/trips/{id}`：查看跨日班次各站时间。
+- `GET /api/versions/{id}/affected-trips`：查方案受影响班次台账（未发布版本返回实时预览，`frozen=false`；已发布返回冻结清单）。
+- `GET /api/trips/{id}/affected-trips`：按班次查它落在哪些方案台账里（含已发布冻结行和未发布预览行）。
 - `GET /api/import-errors`：查看被隔离的错误批次。
 
 ## 测试

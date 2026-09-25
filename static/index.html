@@ -1,10 +1,14 @@
 <!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>公交改道发布</title>
-<style>body{font:15px/1.5 system-ui,sans-serif;max-width:1080px;margin:32px auto;padding:0 18px}input,select,button{padding:7px;margin:3px}.card{border:1px solid #d9e1e8;border-radius:10px;padding:16px;margin:16px 0}pre{background:#f5f7f9;padding:12px;overflow:auto}button{cursor:pointer}small{color:#667}</style></head>
+<style>body{font:15px/1.5 system-ui,sans-serif;max-width:1080px;margin:32px auto;padding:0 18px}input,select,button{padding:7px;margin:3px}.card{border:1px solid #d9e1e8;border-radius:10px;padding:16px;margin:16px 0}pre{background:#f5f7f9;padding:12px;overflow:auto}button{cursor:pointer}small{color:#667}table{border-collapse:collapse;width:100%;margin-top:8px}th,td{border:1px solid #d9e1e8;padding:6px 9px;text-align:left;font-size:13px;vertical-align:top}.badge{display:inline-block;border-radius:999px;padding:1px 10px;font-size:12px}.frozen{background:#e6f4ea;color:#1e6b35}.preview{background:#fef3e0;color:#92590a}.muted{color:#667}</style></head>
 <body><h1>公共交通中断改道发布</h1><p>示例线路中 S1 到 S5 的基线路径耗时 23 分钟。新建临时停运方案后，可比较改道路径，并按草稿、复核、批准、发布流程处理。</p>
 <div class="card"><h2>身份与版本</h2><input id="user" value="planner-01"><select id="role"><option>planner</option><option>reviewer</option><option>admin</option></select><label>版本 ID <input id="version" type="number" value="1"></label><button onclick="refresh()">刷新</button></div>
 <div class="card"><h2>路径查询</h2><label>起点 <input id="from" type="number" value="1"></label><label>终点 <input id="to" type="number" value="5"></label><label>服务日分钟 <input id="at" type="number" value="1430"></label><label><input id="accessible" type="checkbox">仅无障碍</label><button onclick="routeBase()">基线路径</button><button onclick="routeVersion()">版本路径</button><pre id="routeResult">等待查询…</pre></div>
 <div class="card"><h2>方案状态</h2><button onclick="action('submit')">提交复核</button><button onclick="action('approve')">批准</button><button onclick="action('publish')">发布</button><pre id="stateResult"></pre></div>
+<div class="card"><h2>受影响班次台账</h2><p>班次经过被封停或跳站的站点、且到站时间落入生效窗口才会列入；同一班次在同一方案只记一条。发布前为实时预览，发布后随快照冻结。</p>
+<label>方案版本 ID <input id="ledgerVersion" type="number" value="1"></label><button onclick="ledgerByVersion()">按方案查询</button>
+<label>班次 ID <input id="ledgerTrip" type="number" value="1"></label><button onclick="ledgerByTrip()">按班次查询</button>
+<div id="ledgerResult" class="muted">等待查询…</div></div>
 <div class="card"><h2>数据</h2><button onclick="trips()">跨日班次</button><button onclick="errors()">坏数据记录</button><pre id="data">等待操作…</pre></div>
 <script>
 const auth=()=>({'Content-Type':'application/json','X-User':user.value,'X-Role':role.value});
@@ -15,4 +19,11 @@ async function action(name){try{stateResult.textContent=JSON.stringify(await cal
 async function trips(){try{data.textContent=JSON.stringify(await call('/api/trips/1'),null,2)}catch(e){data.textContent=e.message}}
 async function errors(){try{data.textContent=JSON.stringify(await call('/api/import-errors'),null,2)}catch(e){data.textContent=e.message}}
 async function refresh(){try{data.textContent=JSON.stringify({lines:await call('/api/lines'),stops:await call('/api/stops'),versions:await call('/api/versions')},null,2)}catch(e){data.textContent=e.message}}
+const kindName=k=>k==='stop_closure'?'封停':k==='skip_stop'?'跳站':k;
+const clock=m=>m.arrival_clock+(m.arrival_day_offset?(' (+'+m.arrival_day_offset+'日)'):'');
+function ledgerTable(items){if(!items.length)return '<p class="muted">没有受影响班次。</p>';
+return '<table><tr><th>班次</th><th>线路</th><th>方向</th><th>发车</th><th>命中变更（到站时刻）</th><th>方案</th></tr>'+items.map(t=>'<tr><td>#'+t.trip_id+(t.service_code?'<br><small>'+t.service_code+'</small>':'')+'</td><td>#'+t.line_id+'</td><td>'+t.direction+'</td><td>'+t.departure_minute+'</td><td>'+t.matches.map(m=>kindName(m.kind)+' '+m.stop_name+'（'+m.stop_id+'）<small>'+clock(m)+'</small>').join('<br>')+'</td><td>'+(t.version_id!==undefined?'v'+t.version_id+'<br><small>'+t.status+'</small>':'')+'</td></tr>').join('')+'</table>'}
+async function renderLedger(url){try{const j=await call(url);const badge='<span class="badge '+(j.frozen?'frozen':'preview')+'">'+(j.frozen?'已冻结':'预览（未发布）')+'</span>';ledgerResult.innerHTML='<p>'+badge+' 共 '+j.count+' 条受影响班次</p>'+ledgerTable(j.items)}catch(e){ledgerResult.textContent=e.message}}
+async function ledgerByVersion(){renderLedger('/api/versions/'+ledgerVersion.value+'/affected-trips')}
+async function ledgerByTrip(){renderLedger('/api/trips/'+ledgerTrip.value+'/affected-trips')}
 </script></body></html>
