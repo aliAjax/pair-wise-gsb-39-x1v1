@@ -19,6 +19,7 @@ python app.py --port 8010
 - 班次时间以服务日零点起算，允许超过 1440 分钟。例如 1430 分发车、21 分钟到达会显示为次日 `00:21`。
 - 修改只允许发生在草稿版本；创建新版本会复制父版本变更，已发布快照继续保留。
 - 发布在一个 SQLite 事务内写入方案快照和 SHA-256，旧发布版本不会被覆盖。
+- 受影响班次台账：班次走向经过 `stop_closure`、`skip_stop` 站点且到站服务分钟落入变更生效窗口即记一笔，同一班次同一方案只记一条（命中多个变更聚合到 `matches`）。台账在发布事务内同时写入冻结表和快照；发布后基础数据再改也不动已发布清单，只能在新版本里重算。草稿、复核、批准态接口返回实时试算结果（`preview=true`）。
 
 ## API
 
@@ -31,6 +32,7 @@ python app.py --port 8010
 - `POST /api/versions/{id}/submit|approve|reject|publish`：完成复核发布流程。
 - `GET /api/route?from=1&to=5&version_id=1&at_minute=1430&accessible=true`：查询路径、耗时和到达时间。
 - `GET /api/trips/{id}`：查看跨日班次各站时间。
+- `GET /api/affected-trips?version_id=1&trip_id=`：查受影响班次台账；传 `version_id` 按方案查（已发布读冻结清单，未发布实时试算），只传 `trip_id` 返回该班次命中的所有已发布方案。
 - `GET /api/import-errors`：查看被隔离的错误批次。
 
 ## 测试
@@ -39,4 +41,4 @@ python app.py --port 8010
 python -m unittest discover -s tests -v
 ```
 
-测试覆盖基线/改道路径、版本复制与发布隔离、审批冲突、无障碍路径、跨日时刻和坏数据整批隔离。
+测试覆盖基线/改道路径、版本复制与发布隔离、审批冲突、无障碍路径、跨日时刻和坏数据整批隔离，以及受影响班次台账的窗口判定、发布冻结和新版本重算。

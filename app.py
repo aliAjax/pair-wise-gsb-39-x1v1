@@ -140,6 +140,16 @@ class Database:
                     payload TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS affected_trips (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    version_id INTEGER NOT NULL REFERENCES versions(id) ON DELETE CASCADE,
+                    trip_id INTEGER NOT NULL,
+                    line_id INTEGER,
+                    stop_ids TEXT NOT NULL DEFAULT '[]',
+                    detail TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    UNIQUE(version_id,trip_id)
+                );
                 CREATE TABLE IF NOT EXISTS audit_log (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     actor TEXT NOT NULL,
@@ -355,6 +365,7 @@ class Database:
             if not version:
                 raise DomainError("方案版本不存在", 404)
             status = version["status"]
+            affected: list[dict[str, Any]] | None = None
             if action == "submit":
                 if status != "draft" or role not in {"planner", "editor", "admin"}:
                     raise DomainError("只有草稿版本可以提交复核", 409)
@@ -375,13 +386,21 @@ class Database:
                 if status != "approved" or role not in {"reviewer", "admin"}:
                     raise DomainError("只有已批准版本可以发布", 409)
                 changes = [dict(r) for r in conn.execute("SELECT kind,line_id,stop_id,from_stop_id,to_stop_id,travel_minutes,effective_start_minute,effective_end_minute,accessible,payload FROM changes WHERE version_id=? ORDER BY id", (version_id,)).fetchall()]
-                snapshot = {"version_id": version_id, "disruption_id": version["disruption_id"], "version_no": version["version_no"], "changes": changes, "base_hash": self._base_hash(conn)}
+                affected = self._affected_trips_payload(conn, version)
+                snapshot = {"version_id": version_id, "disruption_id": version["disruption_id"], "version_no": version["version_no"], "changes": changes, "affected_trips": affected, "base_hash": self._base_hash(conn)}
                 snapshot_text = canonical(snapshot)
                 digest = hashlib.sha256(snapshot_text.encode()).hexdigest()
-                conn.execute("UPDATE versions SET status='published',snapshot_hash=?,snapshot=?,published_at=?,updated_at=? WHERE id=?", (digest, snapshot_text, utcnow(), utcnow(), version_id))
+                frozen_at = utcnow()
+                conn.execute("UPDATE versions SET status='published',snapshot_hash=?,snapshot=?,published_at=?,updated_at=? WHERE id=?", (digest, snapshot_text, frozen_at, utcnow(), version_id))
+                for entry in affected:
+                    conn.execute(
+                        "INSERT INTO affected_trips(version_id,trip_id,line_id,stop_ids,detail,created_at) VALUES(?,?,?,?,?,?)",
+                        (version_id, entry["trip_id"], entry["line_id"], canonical(entry["stop_ids"]), canonical(entry), frozen_at),
+                    )
             else:
                 raise DomainError("未知状态操作")
-            self._audit(conn, actor, f"version.{action}", "version", version_id, {})
+            self._audit(conn, actor, f"version.{action}", "version", version_id,
+                        {"affected_trips": len(affected)} if action == "publish" else {})
         return dict(conn.execute("SELECT * FROM versions WHERE id=?", (version_id,)).fetchone())
 
     def _base_hash(self, conn: sqlite3.Connection) -> str:
@@ -483,23 +502,122 @@ class Database:
         return {"from_stop_id": from_stop_id, "to_stop_id": to_stop_id, "minutes": distance[to_stop_id], "path": path,
                 "legs": legs, "status": "ok", "arrival": format_service_time(at_minute + distance[to_stop_id])}
 
+    def _trip_schedule(self, conn: sqlite3.Connection, trip: sqlite3.Row) -> list[dict[str, Any]]:
+        """Return the service-minute arrival plan for one trip, honouring direction and >24h times."""
+        rows = conn.execute(
+            "SELECT s.id stop_id,s.code station_code,s.name stop_name,ls.sequence,ls.travel_minutes_from_previous FROM line_stops ls JOIN stops s ON s.id=ls.stop_id WHERE ls.line_id=? ORDER BY ls.sequence",
+            (trip["line_id"],),
+        ).fetchall()
+        if int(trip["direction"]) == 1:
+            rows = list(reversed(rows))
+        current = int(trip["departure_minute"])
+        schedule: list[dict[str, Any]] = []
+        for index, row in enumerate(rows):
+            if index:
+                # For reversed direction, the stored segment time belongs
+                # to the forward direction; use the adjacent forward edge.
+                current += int(row["travel_minutes_from_previous"]) if int(trip["direction"]) == 0 else int(rows[index]["travel_minutes_from_previous"])
+            schedule.append({"stop_id": row["stop_id"], "station_code": row["station_code"], "stop_name": row["stop_name"],
+                             "sequence": int(row["sequence"]), "service_minute": current, **format_service_time(current)})
+        return schedule
+
     def trip_times(self, trip_id: int) -> list[dict[str, Any]]:
         with self.connect() as conn:
             trip = conn.execute("SELECT * FROM trips WHERE id=?", (trip_id,)).fetchone()
             if not trip:
                 raise DomainError("班次不存在", 404)
-            rows = conn.execute("SELECT s.id stop_id,s.code station_code,ls.sequence,ls.travel_minutes_from_previous FROM line_stops ls JOIN stops s ON s.id=ls.stop_id WHERE ls.line_id=? ORDER BY ls.sequence", (trip["line_id"],)).fetchall()
-            if int(trip["direction"]) == 1:
-                rows = list(reversed(rows))
-            current = int(trip["departure_minute"])
-            result = []
-            for index, row in enumerate(rows):
-                if index:
-                    # For reversed direction, the stored segment time belongs
-                    # to the forward direction; use the adjacent forward edge.
-                    current += int(row["travel_minutes_from_previous"]) if int(trip["direction"]) == 0 else int(rows[index]["travel_minutes_from_previous"])
-                result.append({"stop_id": row["stop_id"], "station_code": row["station_code"], "service_minute": current, **format_service_time(current)})
-        return result
+            return self._trip_schedule(conn, trip)
+
+    def _affected_trips_payload(self, conn: sqlite3.Connection, version: sqlite3.Row) -> list[dict[str, Any]]:
+        """Compute the affected-trip ledger for one version.
+
+        A trip is affected when it calls at a stop_closure/skip_stop stop and
+        the service-minute arrival falls inside the change's effective window.
+        Multiple matching changes for the same trip collapse into one entry.
+        """
+        changes = [
+            row for row in conn.execute("SELECT * FROM changes WHERE version_id=? ORDER BY id", (version["id"],)).fetchall()
+            if row["kind"] in {"stop_closure", "skip_stop"}
+        ]
+        if not changes:
+            return []
+        entries: list[dict[str, Any]] = []
+        for trip in conn.execute("SELECT * FROM trips ORDER BY id").fetchall():
+            schedule = self._trip_schedule(conn, trip)
+            at_stop = {int(call["stop_id"]): call for call in schedule}
+            matched: list[dict[str, Any]] = []
+            hit_stop_ids: set[int] = set()
+            for change in changes:
+                stop_id = int(change["stop_id"])
+                call = at_stop.get(stop_id)
+                if call is None:
+                    continue
+                if not _within_window(int(call["service_minute"]), change["effective_start_minute"], change["effective_end_minute"]):
+                    continue
+                matched.append({
+                    "change_id": int(change["id"]),
+                    "kind": change["kind"],
+                    "stop_id": stop_id,
+                    "station_code": call["station_code"],
+                    "stop_name": call["stop_name"],
+                    "sequence": int(call["sequence"]),
+                    "arrival_minute": int(call["service_minute"]),
+                    "arrival_clock": call["clock"],
+                    "arrival_day_offset": call["day_offset"],
+                })
+                hit_stop_ids.add(stop_id)
+            if not matched:
+                continue
+            line = conn.execute("SELECT code,name FROM lines WHERE id=?", (trip["line_id"],)).fetchone()
+            departure = format_service_time(int(trip["departure_minute"]))
+            entries.append({
+                "trip_id": int(trip["id"]),
+                "line_id": int(trip["line_id"]),
+                "line_code": line["code"] if line else None,
+                "line_name": line["name"] if line else None,
+                "service_code": trip["service_code"],
+                "direction": int(trip["direction"]),
+                "departure_minute": int(trip["departure_minute"]),
+                "departure_clock": departure["clock"],
+                "departure_day_offset": departure["day_offset"],
+                "stop_ids": sorted(hit_stop_ids),
+                "earliest_arrival_minute": min(item["arrival_minute"] for item in matched),
+                "matches": sorted(matched, key=lambda item: item["arrival_minute"]),
+            })
+        return sorted(entries, key=lambda item: (item["earliest_arrival_minute"], item["trip_id"]))
+
+    def list_affected_trips(self, version_id: int | None = None, trip_id: int | None = None) -> dict[str, Any]:
+        """Return the affected-trip ledger.
+
+        Published versions read the rows frozen at publish time; non-published
+        versions are recomputed live from current base data and marked preview.
+        """
+        if version_id is None and trip_id is None:
+            raise DomainError("必须提供 version_id 或 trip_id")
+        with self.connect() as conn:
+            if version_id is not None:
+                version = conn.execute("SELECT * FROM versions WHERE id=?", (version_id,)).fetchone()
+                if not version:
+                    raise DomainError("方案版本不存在", 404)
+                if version["status"] == "published":
+                    rows = conn.execute("SELECT * FROM affected_trips WHERE version_id=? ORDER BY detail->>'$.earliest_arrival_minute',trip_id", (version_id,)).fetchall()
+                    items = [json.loads(row["detail"]) for row in rows]
+                    if trip_id is not None:
+                        items = [item for item in items if item["trip_id"] == trip_id]
+                    return {"version_id": version_id, "frozen": True, "items": items}
+                items = self._affected_trips_payload(conn, version)
+                if trip_id is not None:
+                    items = [item for item in items if item["trip_id"] == trip_id]
+                return {"version_id": version_id, "frozen": False, "preview": True, "items": items}
+            exists = conn.execute("SELECT 1 FROM trips WHERE id=?", (trip_id,)).fetchone()
+            if not exists:
+                raise DomainError("班次不存在", 404)
+            items: list[dict[str, Any]] = []
+            for version in conn.execute("SELECT * FROM versions WHERE status='published' ORDER BY id").fetchall():
+                row = conn.execute("SELECT detail FROM affected_trips WHERE version_id=? AND trip_id=?", (version["id"], trip_id)).fetchone()
+                if row:
+                    items.append(json.loads(row["detail"]))
+            return {"trip_id": trip_id, "frozen": True, "items": items}
 
     def list_lines(self) -> list[dict[str, Any]]:
         with self.connect() as conn:
@@ -637,6 +755,12 @@ class Handler(BaseHTTPRequestHandler):
                 version = q.get("version_id", [None])[0]
                 return self._send(self.db.route(int(q["from"][0]), int(q["to"][0]), int(version) if version else None,
                                                 int(q.get("at_minute", ["0"])[0]), q.get("accessible", ["false"])[0].lower() == "true"))
+            if parsed.path == "/api/affected-trips":
+                q = parse_qs(parsed.query)
+                version = q.get("version_id", [None])[0]
+                trip = q.get("trip_id", [None])[0]
+                return self._send(self.db.list_affected_trips(int(version) if version else None,
+                                                              int(trip) if trip else None))
             raise DomainError("接口不存在", 404)
         except (KeyError, ValueError, DomainError) as exc:
             self._send({"error": str(exc)}, getattr(exc, "status", 400))

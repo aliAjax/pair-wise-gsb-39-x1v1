@@ -5,6 +5,7 @@
 <div class="card"><h2>身份与版本</h2><input id="user" value="planner-01"><select id="role"><option>planner</option><option>reviewer</option><option>admin</option></select><label>版本 ID <input id="version" type="number" value="1"></label><button onclick="refresh()">刷新</button></div>
 <div class="card"><h2>路径查询</h2><label>起点 <input id="from" type="number" value="1"></label><label>终点 <input id="to" type="number" value="5"></label><label>服务日分钟 <input id="at" type="number" value="1430"></label><label><input id="accessible" type="checkbox">仅无障碍</label><button onclick="routeBase()">基线路径</button><button onclick="routeVersion()">版本路径</button><pre id="routeResult">等待查询…</pre></div>
 <div class="card"><h2>方案状态</h2><button onclick="action('submit')">提交复核</button><button onclick="action('approve')">批准</button><button onclick="action('publish')">发布</button><pre id="stateResult"></pre></div>
+<div class="card"><h2>受影响班次台账</h2><p>班次经过封停或跳站站点、且到站时间落进生效窗口即记一笔，同一班次同一方案只记一条。发布时随快照冻结；草稿为实时试算。</p><label>方案版本 <input id="affectedVersion" type="number" value="1"></label><label>班次 ID（可选）<input id="affectedTrip" type="number" placeholder="按班次查"></label><button onclick="affected()">查询台账</button><div id="affectedMeta"></div><table id="affectedTable" border="1" cellpadding="6" style="border-collapse:collapse;margin-top:10px;display:none"><thead><tr><th>班次</th><th>线路</th><th>发车</th><th>受影响站点</th><th>最早到站</th><th>变更</th></tr></thead><tbody id="affectedRows"></tbody></table><pre id="affectedResult"></pre></div>
 <div class="card"><h2>数据</h2><button onclick="trips()">跨日班次</button><button onclick="errors()">坏数据记录</button><pre id="data">等待操作…</pre></div>
 <script>
 const auth=()=>({'Content-Type':'application/json','X-User':user.value,'X-Role':role.value});
@@ -15,4 +16,16 @@ async function action(name){try{stateResult.textContent=JSON.stringify(await cal
 async function trips(){try{data.textContent=JSON.stringify(await call('/api/trips/1'),null,2)}catch(e){data.textContent=e.message}}
 async function errors(){try{data.textContent=JSON.stringify(await call('/api/import-errors'),null,2)}catch(e){data.textContent=e.message}}
 async function refresh(){try{data.textContent=JSON.stringify({lines:await call('/api/lines'),stops:await call('/api/stops'),versions:await call('/api/versions')},null,2)}catch(e){data.textContent=e.message}}
+async function affected(){
+  let url='/api/affected-trips?';
+  if(affectedVersion.value)url+='version_id='+affectedVersion.value+'&';
+  if(affectedTrip.value)url+='trip_id='+affectedTrip.value;
+  try{
+    const j=await call(url);
+    affectedMeta.textContent=(j.version_id?('版本 '+j.version_id+'：'):'')+(j.frozen?'已发布冻结清单':'草稿实时试算（发布后才冻结）')+'，共 '+j.items.length+' 条';
+    affectedTable.style.display=j.items.length?'table':'none';
+    affectedRows.innerHTML=j.items.map(it=>'<tr><td>#'+it.trip_id+'<br><small>'+it.service_code+' 方向'+it.direction+'</small></td><td>'+(it.line_code||('#'+it.line_id))+'<br><small>'+(it.line_name||'')+'</small></td><td>'+it.departure_clock+(it.departure_day_offset?(' (+'+it.departure_day_offset+'天)'):'')+'</td><td>'+it.matches.map(m=>m.station_code+' '+m.stop_name+'<br><small>'+m.arrival_clock+(m.arrival_day_offset?(' (+'+m.arrival_day_offset+'天)'):'')+'</small>').join('<br>')+'</td><td>'+it.earliest_arrival_minute+'</td><td>'+it.matches.map(m=>m.kind+' #'+m.change_id).join('<br>')+'</td></tr>').join('');
+    affectedResult.textContent=JSON.stringify(j.items,null,2);
+  }catch(e){affectedTable.style.display='none';affectedMeta.textContent='';affectedResult.textContent=e.message}
+}
 </script></body></html>
